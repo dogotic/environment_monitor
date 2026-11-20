@@ -14,7 +14,7 @@ class BleProvisioner : public QObject
 
     Q_PROPERTY(State   state         READ state         NOTIFY stateChanged)
     Q_PROPERTY(QString statusMessage READ statusMessage NOTIFY statusMessageChanged)
-    Q_PROPERTY(QString wifiResult    READ wifiResult    NOTIFY wifiResultChanged)
+    Q_PROPERTY(QString syncResult    READ syncResult    NOTIFY syncResultChanged)
 
 public:
     enum State { Idle, Scanning, Connecting, Connected, Error };
@@ -25,16 +25,17 @@ public:
 
     State   state()         const { return m_state; }
     QString statusMessage() const { return m_statusMessage; }
-    QString wifiResult()    const { return m_wifiResult; }
+    QString syncResult()    const { return m_syncResult; }
 
     Q_INVOKABLE void startScan();
-    Q_INVOKABLE void sendCredentials(const QString& ssid, const QString& pass);
+    Q_INVOKABLE void sendTime();                 // trenutno vrijeme mobitela
+    Q_INVOKABLE void sendEpoch(qint64 secs);     // proizvoljno vrijeme (UTC epoch)
     Q_INVOKABLE void disconnectBle();
 
 signals:
     void stateChanged();
     void statusMessageChanged();
-    void wifiResultChanged();
+    void syncResultChanged();
 
 private:
     void setStatus(State s, const QString& msg);
@@ -51,7 +52,7 @@ private:
     void onControllerError(QLowEnergyController::Error err);
 
     static const QBluetoothUuid SVC_UUID;
-    static const QBluetoothUuid CRED_UUID;
+    static const QBluetoothUuid TIME_UUID;
     static const QBluetoothUuid STAT_UUID;
 
     QBluetoothDeviceDiscoveryAgent* m_scanner = nullptr;
@@ -60,5 +61,5 @@ private:
 
     State   m_state         = Idle;
     QString m_statusMessage = "Nije spojen";
-    QString m_wifiResult;
+    QString m_syncResult;
 };

@@ -9,7 +9,7 @@ OUT_DIR="$SCRIPT_DIR/android-build"
 QT_DIR="$HOME/Qt/6.12.0/android_arm64_v8a"
 ANDROID_SDK="$HOME/Android/Sdk"
 ANDROID_NDK="$ANDROID_SDK/ndk/27.2.12479018"
-BUILD_TOOLS="$ANDROID_SDK/build-tools/36.1.0"
+BUILD_TOOLS="$ANDROID_SDK/build-tools/36.0.0"
 
 UNSIGNED_APK="$BUILD_DIR/android-build/build/outputs/apk/release/android-build-release-unsigned.apk"
 SIGNED_APK="$SCRIPT_DIR/EnvMonitorApp.apk"

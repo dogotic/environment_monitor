@@ -1,12 +1,11 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-#include <WiFi.h>
-#include <Preferences.h>
 #include <NimBLEDevice.h>
 #include <time.h>
+#include <sys/time.h>
 #include <Wire.h>
-#include <Adafruit_SHT4x.h>   // uncomment when sensor is wired up
+#include <Adafruit_SHT4x.h>
 
 // ── Pins ──────────────────────────────────────────────────────────
 #define PIN_SDA  5
@@ -18,9 +17,23 @@
 #define TFT_RST   8
 #define TFT_MISO 12
 
-// ── NTP / timezone ────────────────────────────────────────────────
+// ── Timezone ──────────────────────────────────────────────────────
+// RTC i sistemski sat drže UTC; lokalno vrijeme se računa preko TZ.
 #define TZ_INFO  "CET-1CEST,M3.5.0,M10.5.0/3"
-#define NTP_HOST "pool.ntp.org"
+
+// ── RTC (DS3231M, I2C) ────────────────────────────────────────────
+#define RTC_ADDR        0x68
+#define RTC_REG_TIME    0x00
+#define RTC_REG_CONTROL 0x0E
+#define RTC_REG_STATUS  0x0F
+#define RTC_OSF         0x80     // Oscillator Stop Flag (vrijeme nevažeće)
+#define RTC_EOSC        0x80     // Control: 1 = oscilator stoji na bateriji
+#define RTC_RESYNC_MS   3600000UL // svaki sat sistemski sat prema RTC-u
+
+// Važeći raspon vremena: 2024-01-01 .. 2100-01-01 (UTC)
+// (gornja granica hvata npr. epoch u milisekundama)
+#define TIME_VALID_MIN  1704067200LL
+#define TIME_VALID_MAX  4102444800LL
 
 // ── Comfort bar colors (RGB565) ───────────────────────────────────
 #define COLOR_DRY     0xFD20   // amber  (255, 165,   0)
@@ -29,38 +42,39 @@
 
 // ── BLE UUIDs ─────────────────────────────────────────────────────
 #define BLE_SVC  "12345678-1234-5678-1234-56789abcdef0"
-#define BLE_CRED "12345678-1234-5678-1234-56789abcdef1"
-#define BLE_STAT "12345678-1234-5678-1234-56789abcdef2"
+#define BLE_TIME "12345678-1234-5678-1234-56789abcdef1"   // write: postavi vrijeme, read: trenutni epoch
+#define BLE_STAT "12345678-1234-5678-1234-56789abcdef2"   // read/notify: status
 
-// ── State ─────────────────────────────────────────────────────────
-enum AppState { ST_PROVISION, ST_CONNECTING, ST_ONLINE };
+// ── Globals ───────────────────────────────────────────────────────
+Adafruit_ILI9341 tft(&SPI, TFT_DC, TFT_CS, TFT_RST);   // hardware SPI
+Adafruit_SHT4x   sht4;
 
-Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST, TFT_MISO);
-Preferences prefs;
+bool  sensorOk     = false;
+bool  rtcOk        = false;
+float tempC        = NAN;
+float rhPct        = NAN;
 
-AppState      appState     = ST_PROVISION;
-volatile bool doConnect    = false;
-bool          bleConnected = false;
-
-float tempC = NAN;
-float rhPct = NAN;
+volatile bool bleConnected = false;
+// BLE callback (NimBLE task) → loop(); 64-bit vrijednost pa ide pod lock
+portMUX_TYPE  timeMux      = portMUX_INITIALIZER_UNLOCKED;
+bool          timePending  = false;
+int64_t       pendingEpoch = 0;
 
 NimBLECharacteristic* charStat = nullptr;
-Adafruit_SHT4x sht4;
-bool sensorOk = false;
 
 // ── Helpers ───────────────────────────────────────────────────────
-static String jsonField(const String& j, const char* key) {
-    String needle = String('"') + key + "\":\"";
-    int s = j.indexOf(needle);
-    if (s < 0) return "";
-    s += needle.length();
-    int e = j.indexOf('"', s);
-    return j.substring(s, e);
-}
-
 static void bleNotify(const char* msg) {
     if (charStat) { charStat->setValue(msg); charStat->notify(); }
+}
+
+static bool timeValid() {
+    time_t now = time(nullptr);
+    return now >= TIME_VALID_MIN && now < TIME_VALID_MAX;
+}
+
+static void setSystemTime(time_t epoch) {
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
 }
 
 // print centered text — bg color overwrites old text, no fillScreen needed
@@ -74,19 +88,146 @@ static void printCenter(const char* str, int16_t y, uint8_t sz,
     tft.print(str);
 }
 
-// ── BLE callbacks ─────────────────────────────────────────────────
-struct CredCB : NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
-        String val  = c->getValue().c_str();
-        String ssid = jsonField(val, "ssid");
-        String pass = jsonField(val, "pass");
-        if (ssid.isEmpty()) { bleNotify("ERR:no_ssid"); return; }
-        prefs.begin("wifi", false);
-        prefs.putString("ssid", ssid);
-        prefs.putString("pass", pass);
-        prefs.end();
-        bleNotify("connecting");
-        doConnect = true;
+// ── DS3231M ───────────────────────────────────────────────────────
+static uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static uint8_t bin2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+// dani od 1970-01-01 za (y, m, d) — proleptički gregorijanski (H. Hinnant)
+static long daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const long era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (long)doe - 719468;
+}
+
+static bool rtcReadReg(uint8_t reg, uint8_t* buf, uint8_t len) {
+    Wire.beginTransmission(RTC_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)RTC_ADDR, len) != len) return false;
+    for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+    return true;
+}
+
+static bool rtcWriteReg(uint8_t reg, const uint8_t* buf, uint8_t len) {
+    Wire.beginTransmission(RTC_ADDR);
+    Wire.write(reg);
+    Wire.write(buf, len);
+    return Wire.endTransmission() == 0;
+}
+
+static bool rtcProbe() {
+    Wire.beginTransmission(RTC_ADDR);
+    return Wire.endTransmission() == 0;
+}
+
+// Vraća UTC epoch ili -1 ako RTC nema važeće vrijeme (OSF ili I2C greška)
+static time_t rtcRead() {
+    uint8_t st;
+    if (!rtcReadReg(RTC_REG_STATUS, &st, 1) || (st & RTC_OSF)) return -1;
+    uint8_t r[7];
+    if (!rtcReadReg(RTC_REG_TIME, r, 7)) return -1;
+    int sec  = bcd2bin(r[0] & 0x7F);
+    int min  = bcd2bin(r[1] & 0x7F);
+    int hour;
+    if (r[2] & 0x40) {                       // 12h mod (ne bismo trebali, ali za svaki slučaj)
+        hour = bcd2bin(r[2] & 0x1F) % 12;
+        if (r[2] & 0x20) hour += 12;
+    } else {
+        hour = bcd2bin(r[2] & 0x3F);
+    }
+    int day  = bcd2bin(r[4] & 0x3F);
+    int mon  = bcd2bin(r[5] & 0x1F);
+    int year = 2000 + bcd2bin(r[6]) + ((r[5] & 0x80) ? 100 : 0);
+    if (mon < 1 || mon > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59)
+        return -1;
+    return (time_t)daysFromCivil(year, mon, day) * 86400L + hour * 3600L + min * 60L + sec;
+}
+
+static bool rtcWrite(time_t epoch) {
+    struct tm u;
+    gmtime_r(&epoch, &u);
+    int yr = u.tm_year + 1900 - 2000;
+    if (yr < 0 || yr > 199) return false;
+    uint8_t r[7] = {
+        bin2bcd(u.tm_sec),
+        bin2bcd(u.tm_min),
+        bin2bcd(u.tm_hour),                          // 24h mod
+        (uint8_t)(u.tm_wday == 0 ? 7 : u.tm_wday),   // 1..7
+        bin2bcd(u.tm_mday),
+        (uint8_t)(bin2bcd(u.tm_mon + 1) | (yr >= 100 ? 0x80 : 0)),
+        bin2bcd(yr % 100),
+    };
+    if (!rtcWriteReg(RTC_REG_TIME, r, 7)) return false;
+    // EOSC=0 → oscilator radi i na bateriji
+    uint8_t ctl;
+    if (rtcReadReg(RTC_REG_CONTROL, &ctl, 1) && (ctl & RTC_EOSC)) {
+        ctl &= ~RTC_EOSC;
+        if (!rtcWriteReg(RTC_REG_CONTROL, &ctl, 1)) return false;
+    }
+    // obriši OSF (i ostale flagove), ostavi 32kHz izlaz ugašen
+    uint8_t st = 0x00;
+    return rtcWriteReg(RTC_REG_STATUS, &st, 1);
+}
+
+// Sistemski sat ← RTC (ako RTC postoji i ima važeće vrijeme)
+static bool syncFromRtc() {
+    if (!rtcOk) return false;
+    time_t e = rtcRead();
+    if (e < TIME_VALID_MIN || e >= TIME_VALID_MAX) return false;
+    setSystemTime(e);
+    return true;
+}
+
+// ── BLE ───────────────────────────────────────────────────────────
+// Prihvaćeni formati upisa u BLE_TIME:
+//   "1763650000"            → Unix epoch (UTC, sekunde)
+//   "2026-11-20 14:30:00"   → lokalno vrijeme (CET/CEST), sekunde opcionalne
+// Vraća epoch (UTC) ili -1 ako format ne valja; raspon provjerava pozivatelj
+static int64_t parseTime(const std::string& raw) {
+    String s = String(raw.c_str());
+    s.trim();
+    if (s.isEmpty()) return -1;
+
+    bool allDigits = true;
+    for (size_t i = 0; i < s.length(); i++)
+        if (!isDigit(s[i])) { allDigits = false; break; }
+    if (allDigits) {
+        if (s.length() > 12) return -1;          // ms epoch i slično — ne pokušavaj
+        return strtoll(s.c_str(), nullptr, 10);
+    }
+
+    int Y, M, D, h, m, sec = 0;
+    int n = sscanf(s.c_str(), "%d-%d-%d%*[ T]%d:%d:%d", &Y, &M, &D, &h, &m, &sec);
+    if (n < 5) return -1;
+    if (M < 1 || M > 12 || D < 1 || D > 31 || h > 23 || m > 59 || sec > 59) return -1;
+    struct tm t = {};
+    t.tm_year  = Y - 1900;
+    t.tm_mon   = M - 1;
+    t.tm_mday  = D;
+    t.tm_hour  = h;
+    t.tm_min   = m;
+    t.tm_sec   = sec;
+    t.tm_isdst = -1;                 // neka mktime sam odredi CET/CEST
+    return (int64_t)mktime(&t);
+}
+
+struct TimeCB : NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
+        int64_t e = parseTime(c->getValue());
+        if (e < TIME_VALID_MIN || e >= TIME_VALID_MAX) { bleNotify("err:format"); return; }
+        // I2C/RTC radimo u loop(), ne u BLE tasku (dijeli bus sa SHT4x)
+        portENTER_CRITICAL(&timeMux);
+        pendingEpoch = e;
+        timePending  = true;
+        portEXIT_CRITICAL(&timeMux);
+    }
+    void onRead(NimBLECharacteristic* c, NimBLEConnInfo&) override {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%lld", timeValid() ? (long long)time(nullptr) : 0LL);
+        c->setValue(buf);
     }
 };
 
@@ -103,13 +244,13 @@ static void initBLE() {
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     auto* srv = NimBLEDevice::createServer();
     srv->setCallbacks(new SrvCB());
-    auto* svc  = srv->createService(BLE_SVC);
-    auto* cred = svc->createCharacteristic(BLE_CRED, NIMBLE_PROPERTY::WRITE);
-    cred->setCallbacks(new CredCB());
+    auto* svc = srv->createService(BLE_SVC);
+    auto* chTime = svc->createCharacteristic(
+        BLE_TIME, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    chTime->setCallbacks(new TimeCB());
     charStat = svc->createCharacteristic(
         BLE_STAT, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-    charStat->setValue("ready");
-    svc->start();
+    charStat->setValue(rtcOk ? "ready:rtc" : "ready:local");
 
     // Put name + service UUID in advertisement data (not scan response) so
     // Android 12+ passive BLE scan (neverForLocation) can discover the device.
@@ -119,55 +260,36 @@ static void initBLE() {
     pAdv->start();
 }
 
-// ── WiFi ──────────────────────────────────────────────────────────
-static bool connectWiFi() {
-    prefs.begin("wifi", true);
-    String ssid = prefs.getString("ssid", "");
-    String pass = prefs.getString("pass", "");
-    prefs.end();
-    if (ssid.isEmpty()) return false;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
-    if (WiFi.status() == WL_CONNECTED) {
-        configTzTime(TZ_INFO, NTP_HOST);
-        bleNotify(("ok:" + WiFi.localIP().toString()).c_str());
-        return true;
+// Obradi vrijeme primljeno preko BLE-a (poziva se iz loop())
+static void applyPendingTime() {
+    portENTER_CRITICAL(&timeMux);
+    bool pending = timePending;
+    time_t e     = (time_t)pendingEpoch;
+    timePending  = false;
+    portEXIT_CRITICAL(&timeMux);
+    if (!pending) return;
+    setSystemTime(e);
+
+    if (!rtcOk) rtcOk = rtcProbe();          // možda je RTC naknadno spojen
+    if (rtcOk && rtcWrite(e)) {
+        bleNotify("ok:rtc");
+        Serial.printf("Vrijeme postavljeno (RTC): %lld\n", (long long)e);
+    } else {
+        rtcOk = false;
+        bleNotify("ok:local");
+        Serial.printf("Vrijeme postavljeno (lokalno, bez RTC): %lld\n", (long long)e);
     }
-    WiFi.disconnect();
-    bleNotify("fail");
-    return false;
 }
 
 // ── Display ───────────────────────────────────────────────────────
-
-// called when leaving ST_ONLINE so next entry redraws the frame
-static bool onlineFrameDrawn = false;
-static void invalidateOnline() { onlineFrameDrawn = false; }
-
-static void drawProvision() {
-    invalidateOnline();
-    tft.fillScreen(ILI9341_BLACK);
-    printCenter("WiFi Setup",      55,  3, ILI9341_WHITE);
-    printCenter("BLE: EnvMonitor", 100, 2, ILI9341_CYAN);
-    printCenter(bleConnected ? "Spojen" : "Ceka BLE...", 130, 2,
-                bleConnected ? ILI9341_GREEN : ILI9341_DARKGREY);
-}
-
-static void drawConnecting(const String& ssid) {
-    invalidateOnline();
-    tft.fillScreen(ILI9341_BLACK);
-    printCenter("Spajam na WiFi:", 90,  2, ILI9341_YELLOW);
-    printCenter(ssid.c_str(),      125, 3, ILI9341_WHITE);
-}
-
-static void drawOnline() {
+static void drawMain() {
     struct tm t;
-    bool timeOk = getLocalTime(&t, 100);
+    bool timeOk = timeValid();
+    if (timeOk) { time_t now = time(nullptr); localtime_r(&now, &t); }
 
     // ── Static frame (drawn once) ─────────────────────────────────
-    if (!onlineFrameDrawn) {
+    static bool frameDrawn = false;
+    if (!frameDrawn) {
         tft.fillScreen(ILI9341_BLACK);
         // °C: small circle + "C" in top-left
         tft.drawCircle(5, 5, 3, ILI9341_WHITE);
@@ -177,7 +299,7 @@ static void drawOnline() {
         tft.setCursor(305, 2); tft.print("%");
         // separator above bottom row
         tft.drawFastHLine(0, 143, 320, ILI9341_DARKGREY);
-        onlineFrameDrawn = true;
+        frameDrawn = true;
     }
 
     // ── Temperature (textSize 5, left) ────────────────────────────
@@ -188,7 +310,7 @@ static void drawOnline() {
         lastTemp = tempC;
         char buf[8];
         if (isnan(tempC)) strcpy(buf, " --.-");
-        else              sprintf(buf, "%5.1f", tempC);
+        else              snprintf(buf, sizeof(buf), "%5.1f", tempC);
         tft.setTextSize(5); tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
         tft.setCursor(0, 22);
         tft.print(buf);
@@ -202,7 +324,7 @@ static void drawOnline() {
         lastRh = rhPct;
         char buf[5];
         if (isnan(rhPct)) strcpy(buf, "--");
-        else              sprintf(buf, "%.0f", rhPct);
+        else              snprintf(buf, sizeof(buf), "%.0f", rhPct);
         tft.fillRect(170, 22, 148, 50, ILI9341_BLACK);
         tft.setTextSize(6); tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
         int16_t x1, y1; uint16_t w, h;
@@ -214,10 +336,12 @@ static void drawOnline() {
     // ── Comfort bar + humidity marker ─────────────────────────────
     // Redrawn only when humidity changes by ≥0.5% or on first draw
     static float lastRhBar = NAN;
-    bool barChanged = isnan(lastRhBar) ||
+    static bool  barDrawn  = false;
+    bool barChanged = !barDrawn ||
                       (isnan(rhPct) != isnan(lastRhBar)) ||
                       (!isnan(rhPct) && fabsf(rhPct - lastRhBar) >= 0.5f);
     if (barChanged) {
+        barDrawn  = true;
         lastRhBar = rhPct;
         // Clear marker zone between temp text and bar
         tft.fillRect(0, 73, 320, 36, ILI9341_BLACK);
@@ -242,38 +366,71 @@ static void drawOnline() {
     }
 
     // ── Clock (HH:MM, bottom-left) ────────────────────────────────
-    static int8_t lastMin = -2;
-    if (timeOk && t.tm_min != lastMin) {
-        lastMin = t.tm_min;
+    // -1 = još ništa nacrtano, -2 = prikazano "--:--"
+    static int8_t lastMin = -1, lastHour = -1;
+    if (timeOk && (t.tm_min != lastMin || t.tm_hour != lastHour)) {
+        lastMin = t.tm_min; lastHour = t.tm_hour;
         tft.setTextSize(2); tft.setTextColor(ILI9341_LIGHTGREY, ILI9341_BLACK);
         tft.setCursor(2, 158); tft.print(t.tm_hour < 12 ? "AM" : "PM");
         char tbuf[6];
         int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
-        sprintf(tbuf, "%02d:%02d", h12, t.tm_min);
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d", h12, t.tm_min);
         tft.setTextSize(4); tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
         tft.setCursor(34, 150); tft.print(tbuf);
     } else if (!timeOk && lastMin != -2) {
-        lastMin = -2;
+        lastMin = -2; lastHour = -1;
         tft.fillRect(0, 148, 160, 36, ILI9341_BLACK);
         tft.setTextSize(4); tft.setTextColor(ILI9341_DARKGREY, ILI9341_BLACK);
         tft.setCursor(34, 150); tft.print("--:--");
     }
 
     // ── Date (DD/MM, bottom-right) ────────────────────────────────
-    static int8_t lastDay = -1;
-    if (timeOk && t.tm_mday != lastDay) {
-        lastDay = t.tm_mday;
+    static int8_t lastDay = -1, lastMon = -1;
+    if (timeOk && (t.tm_mday != lastDay || t.tm_mon != lastMon)) {
+        lastDay = t.tm_mday; lastMon = t.tm_mon;
         char dbuf[6];
-        sprintf(dbuf, "%02d/%02d", t.tm_mday, t.tm_mon + 1);
+        snprintf(dbuf, sizeof(dbuf), "%02d/%02d", t.tm_mday, t.tm_mon + 1);
         tft.setTextSize(4); tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
         tft.setCursor(180, 150); tft.print(dbuf);
+    } else if (!timeOk && lastDay != -2) {
+        lastDay = -2; lastMon = -1;
+        tft.setTextSize(4); tft.setTextColor(ILI9341_DARKGREY, ILI9341_BLACK);
+        tft.setCursor(180, 150); tft.print("--/--");
+    }
+
+    // ── Status line (bottom): izvor vremena + BLE ────────────────
+    // 0 = bez vremena, 1 = lokalno, 2 = RTC; +10 ako je BLE spojen
+    static int8_t lastStatus = -1;
+    int8_t status = (timeOk ? (rtcOk ? 2 : 1) : 0) + (bleConnected ? 10 : 0);
+    if (status != lastStatus) {
+        lastStatus = status;
+        tft.fillRect(0, 218, 320, 22, ILI9341_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(4, 222);
+        if (!timeOk) {
+            tft.setTextColor(ILI9341_ORANGE, ILI9341_BLACK);
+            tft.print("Postavi vrijeme (BLE)");
+        } else if (rtcOk) {
+            tft.setTextColor(ILI9341_DARKGREY, ILI9341_BLACK);
+            tft.print("RTC");
+        } else {
+            tft.setTextColor(ILI9341_DARKGREY, ILI9341_BLACK);
+            tft.print("bez RTC");
+        }
+        if (bleConnected) {
+            tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
+            tft.setCursor(280, 222); tft.print("BT");
+        }
     }
 }
 
 // ── Setup / Loop ──────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.begin(PIN_SDA, PIN_SCL, 25000);
+
+    setenv("TZ", TZ_INFO, 1);
+    tzset();
 
     tft.begin();
     tft.setRotation(1);
@@ -284,52 +441,43 @@ void setup() {
     sensorOk = sht4.begin(&Wire);
     if (sensorOk) sht4.setPrecision(SHT4X_HIGH_PRECISION);
 
-    initBLE();
-
-    prefs.begin("wifi", true);
-    String savedSSID = prefs.getString("ssid", "");
-    prefs.end();
-
-    if (!savedSSID.isEmpty()) {
-        appState = ST_CONNECTING;
-        drawConnecting(savedSSID);
-        appState = connectWiFi() ? ST_ONLINE : ST_PROVISION;
+    rtcOk = rtcProbe();
+    if (rtcOk) {
+        if (syncFromRtc()) Serial.println("RTC: vrijeme ucitano");
+        else               Serial.println("RTC: pronaden, ali vrijeme nije postavljeno");
+    } else {
+        Serial.println("RTC: nije pronaden, vrijeme samo lokalno");
     }
+
+    initBLE();
 }
 
 void loop() {
     static uint32_t lastDraw   = 0;
     static uint32_t lastSensor = 0;
+    static uint32_t lastRtcSync = 0;
 
-    if (doConnect) {
-        doConnect = false;
-        prefs.begin("wifi", true);
-        String ssid = prefs.getString("ssid", "");
-        prefs.end();
-        appState = ST_CONNECTING;
-        drawConnecting(ssid);
-        appState = connectWiFi() ? ST_ONLINE : ST_PROVISION;
-    }
+    applyPendingTime();
 
-    if (appState == ST_ONLINE && WiFi.status() != WL_CONNECTED) {
-        prefs.begin("wifi", true);
-        String ssid = prefs.getString("ssid", "");
-        String pass = prefs.getString("pass", "");
-        prefs.end();
-        if (!ssid.isEmpty()) WiFi.begin(ssid.c_str(), pass.c_str());
+    // Povremeno ispravi drift ESP32 sata prema DS3231M
+    if (rtcOk && millis() - lastRtcSync >= RTC_RESYNC_MS) {
+        lastRtcSync = millis();
+        syncFromRtc();
     }
 
     if (millis() - lastDraw >= 1000) {
         lastDraw = millis();
-        if      (appState == ST_PROVISION) drawProvision();
-        else if (appState == ST_ONLINE)    drawOnline();
+        drawMain();
     }
 
     if (sensorOk && millis() - lastSensor >= 5000) {
         lastSensor = millis();
         sensors_event_t h, tmp;
-        sht4.getEvent(&h, &tmp);
-        tempC = tmp.temperature;
-        rhPct = h.relative_humidity;
+        if (sht4.getEvent(&h, &tmp)) {
+            tempC = tmp.temperature;
+            rhPct = h.relative_humidity;
+        } else {
+            tempC = rhPct = NAN;                 // senzor ne odgovara → "--"
+        }
     }
 }

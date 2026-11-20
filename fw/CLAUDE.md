@@ -27,19 +27,13 @@ Board core: `esp32:esp32` (Espressif ESP32 Arduino core).
 
 ## Architecture
 
-Single `.ino` file, no build system beyond Arduino. The firmware runs a 3-state machine:
+Single `.ino` file, no build system beyond Arduino. No WiFi — time/date is set over BLE and kept by a DS3231M RTC when present.
 
-```
-ST_PROVISION  →  ST_CONNECTING  →  ST_ONLINE
-     ↑                                  |
-     └──────── WiFi drops / BLE write ──┘
-```
+**Time setting (BLE):** GATT server advertises as `EnvMonitor`. Writing to `BLE_TIME` (`...def1`) sets date+time; accepted formats: Unix epoch seconds (UTC, e.g. `1763650000`) or local time `YYYY-MM-DD HH:MM[:SS]` (CET/CEST). Reading `BLE_TIME` returns the current epoch (`0` if unset). `BLE_STAT` (`...def2`) notifies `ok:rtc`, `ok:local` or `err:format`. The BLE callback only stores the value; I2C work happens in `loop()` (`applyPendingTime`) because the bus is shared with the SHT4x.
 
-**Provisioning (ST_PROVISION):** BLE GATT server advertises as `EnvMonitor`. A mobile app writes `{"ssid":"...","pass":"..."}` JSON to the credential characteristic (`BLE_CRED`). The status characteristic (`BLE_STAT`) notifies back `connecting`, `ok:<ip>`, or `fail`. Credentials are persisted in NVS via `Preferences` under the `"wifi"` namespace.
+**RTC (DS3231M @ 0x68):** Minimal register-level driver over `Wire`, no library. RTC stores UTC (24h mode); local time comes from the `TZ` env var. On boot: if the RTC answers and its OSF flag is clear, the system clock is loaded from it; otherwise time stays unset (`--:--`). Without an RTC, time lives only in the ESP32 system clock and is lost on power loss. The system clock is re-synced from the RTC every hour. A time write re-probes the RTC, so a later-connected RTC gets picked up.
 
-**Online (ST_ONLINE):** NTP sync via `configTzTime` (CET/CEST timezone). The main loop redraws the TFT at 1 Hz and polls the SHT4x sensor every 5 s.
-
-**Display strategy:** `drawOnline()` avoids `fillScreen` on every frame. The static frame (separator lines, label text) is drawn once behind `onlineFrameDrawn`. Each data region (clock, date, T, rH, status bar) is redrawn only when its value changes, using a fixed-width format so old text is fully overwritten by the new text.
+**Display strategy:** `drawMain()` avoids `fillScreen` on every frame. The static frame is drawn once; each data region (T, rH, comfort bar, clock, date, status line) is redrawn only when its value changes, using fixed-width text so new text overwrites old.
 
 ## Hardware
 
@@ -54,6 +48,6 @@ ST_PROVISION  →  ST_CONNECTING  →  ST_ONLINE
 | I2C SDA | 5           |
 | I2C SCL | 6           |
 
-Display: ILI9341, 320×240, rotation 1 (landscape). The SHT4x temperature/humidity sensor is on I2C.
+Display: ILI9341, 320×240, rotation 1 (landscape). The SHT4x sensor and the optional DS3231M RTC share the I2C bus (25 kHz).
 
-**Known issue:** `PIN_SDA` is defined as `5l` (digit 5 followed by letter l) — this is a typo for `5`. It compiles because `5l` is a valid long literal, but flag it if refactoring pin definitions.
+**Note:** the TFT uses hardware SPI (`SPI` default pins), the MOSI/SCK/MISO defines are informational.

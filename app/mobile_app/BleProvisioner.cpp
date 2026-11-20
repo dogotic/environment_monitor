@@ -1,9 +1,8 @@
 #include "BleProvisioner.h"
-#include <QJsonObject>
-#include <QJsonDocument>
+#include <QDateTime>
 
 const QBluetoothUuid BleProvisioner::SVC_UUID  { QString("12345678-1234-5678-1234-56789abcdef0") };
-const QBluetoothUuid BleProvisioner::CRED_UUID { QString("12345678-1234-5678-1234-56789abcdef1") };
+const QBluetoothUuid BleProvisioner::TIME_UUID { QString("12345678-1234-5678-1234-56789abcdef1") };
 const QBluetoothUuid BleProvisioner::STAT_UUID { QString("12345678-1234-5678-1234-56789abcdef2") };
 
 BleProvisioner::BleProvisioner(QObject* parent) : QObject(parent) {}
@@ -24,8 +23,8 @@ void BleProvisioner::startScan() {
     if (m_svc)   { m_svc->deleteLater();   m_svc  = nullptr; }
     if (m_ctrl)  { m_ctrl->disconnectFromDevice(); m_ctrl->deleteLater(); m_ctrl = nullptr; }
     if (m_scanner) { m_scanner->stop(); m_scanner->deleteLater(); }
-    m_wifiResult.clear();
-    emit wifiResultChanged();
+    m_syncResult.clear();
+    emit syncResultChanged();
 
     setStatus(Scanning, "Skeniram BLE uređaje...");
 
@@ -119,28 +118,38 @@ void BleProvisioner::onCharacteristicChanged(const QLowEnergyCharacteristic& c,
     if (c.uuid() != STAT_UUID) return;
     QString v = QString::fromUtf8(val);
 
-    if (v.startsWith("ok:"))    setStatus(Connected, "WiFi spojen! IP: " + v.mid(3));
-    else if (v == "fail")       setStatus(Connected, "Spajanje neuspješno — provjeri SSID/lozinku.");
-    else if (v == "connecting") setStatus(Connected, "Spajam na WiFi mrežu...");
+    if (v == "ok:rtc")          setStatus(Connected, "Vrijeme postavljeno (spremljeno u RTC).");
+    else if (v == "ok:local")   setStatus(Connected, "Vrijeme postavljeno (bez RTC-a).");
+    else if (v == "err:format") setStatus(Connected, "ESP32 je odbio vrijeme (neispravan format).");
+    else if (v.startsWith("ready")) return;   // početni status, nije odgovor na sync
     else                        setStatus(Connected, v);
 
-    m_wifiResult = v;
-    emit wifiResultChanged();
+    m_syncResult = v;
+    emit syncResultChanged();
 }
 
 // ── Actions ───────────────────────────────────────────────────────
 
-void BleProvisioner::sendCredentials(const QString& ssid, const QString& pass) {
+// Sends the phone's current time.
+void BleProvisioner::sendTime() {
+    sendEpoch(QDateTime::currentSecsSinceEpoch());
+}
+
+// Sends a time as Unix epoch seconds (UTC), ASCII decimal.
+// The firmware applies its own timezone (CET/CEST).
+void BleProvisioner::sendEpoch(qint64 secs) {
     if (m_state != Connected || !m_svc) return;
 
-    QJsonObject obj{{ "ssid", ssid }, { "pass", pass }};
-    QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    auto chr = m_svc->characteristic(TIME_UUID);
+    if (!chr.isValid()) {
+        setStatus(Error, "Karakteristika za vrijeme nije pronađena.");
+        return;
+    }
 
-    auto cred = m_svc->characteristic(CRED_UUID);
-    if (cred.isValid())
-        m_svc->writeCharacteristic(cred, json, QLowEnergyService::WriteWithoutResponse);
+    QByteArray payload = QByteArray::number(secs);
+    m_svc->writeCharacteristic(chr, payload, QLowEnergyService::WriteWithResponse);
 
-    setStatus(Connected, "Poslano, čekam odgovor ESP32...");
+    setStatus(Connected, "Šaljem vrijeme, čekam odgovor ESP32...");
 }
 
 void BleProvisioner::disconnectBle() {
